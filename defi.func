@@ -66,18 +66,18 @@ void swapAtoB(int poolId, int amountA) {
     sendToken(msg.sender, amountB);
 }
 
-// Function to stake tokens
-void stake(int amount) {
+// Function to stake LP tokens for yield farming
+void stakeLP(int amount) {
     Staker staker = stakers[msg.sender];
     staker.stakedAmount += amount;
     staker.rewardDebt += (amount * rewardPerBlock);
     stakers[msg.sender] = staker;
-    // Transfer tokens to the contract for staking
+    // Transfer LP tokens to the contract for staking
     receiveToken(msg.sender, amount);
 }
 
-// Function to claim staking rewards
-void claimRewards() {
+// Function to claim yield farming rewards
+void claimYieldRewards() {
     Staker staker = stakers[msg.sender];
     int pendingReward = (staker.stakedAmount * rewardPerBlock) - staker.rewardDebt;
     staker.rewardDebt = staker.stakedAmount * rewardPerBlock;
@@ -134,4 +134,9 @@ void receiveToken(address sender, int amount) {
 int getCurrentBlock() {
     // Logic to obtain the current block number
     return 0; // Placeholder
+}
+
+// Main function to handle incoming messages
+void main() {
+    // Logic to handle different types of messages and function calls
 }
