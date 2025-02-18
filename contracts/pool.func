@@ -1,0 +1,1221 @@
+#pragma version >=0.2.0;
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; sdlib++
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+(int) equal_slices (slice s1, slice s2) asm "SDEQ";
+(int) mod (int x, int y) asm "MOD";
+(int) divc (int x, int y) asm "DIVC";
+slice preload_bits_offset(slice s, int offset, int len) asm "SDSUBSTR";
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; gas.func 
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+cell get_gas_config_param(int wc) inline {
+    if (wc == -1) {
+        return config_param(20);
+    } else {
+        return config_param(21);
+    }
+}
+
+(slice, (int, int)) load_gas_flat_pfx(slice param) inline {
+    var flat_gas_limit = param~load_uint(64);
+    var flat_gas_price = param~load_uint(64);
+    return (param, (flat_gas_limit, flat_gas_price));
+}
+
+(slice, int) load_gas_prices(slice param) inline {
+    var gas_price = param~load_uint(64);
+    return (param, gas_price);
+}
+
+(slice, (int, int, int)) load_gas_limits_prices(slice param) inline_ref {
+    var contructor_tag = param~load_uint(8);
+    if (contructor_tag == 0xd1) {
+        var (flat_gas_limit, flat_gas_price) = param~load_gas_flat_pfx();
+        var (_, _, gas_price) = param~load_gas_limits_prices();
+        return (param, (flat_gas_limit, flat_gas_price, gas_price));
+    } elseif ((contructor_tag == 0xde) | (contructor_tag == 0xdd)) {
+        var gas_price = param~load_gas_prices();
+        return (param, (0, 0, gas_price));
+    } else {
+        return (param, (0, 0, 0));
+    }
+}
+
+(int, int, int) get_gas_limits_prices(int wc) inline {
+    var gas_price_config = get_gas_config_param(wc).begin_parse();
+    return gas_price_config~load_gas_limits_prices();
+}
+
+int get_gas_fee(int gas_amount, int wc) inline_ref {
+    var (flat_gas_limit, flat_gas_price, gas_price) = get_gas_limits_prices(wc);
+    return gas_amount < flat_gas_limit ? flat_gas_price : (gas_amount - flat_gas_limit) * (gas_price >> 16) + flat_gas_price;
+}
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; messages 
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+const NORMAL = 0;
+const PAID_EXTERNALLY = 1;
+const IGNORE_ERRORS = 2;
+
+const DESTROY_IF_ZERO = 32;
+const CARRY_REMAINING_GAS = 64;
+const CARRY_ALL_BALANCE = 128;
+
+() send_empty_message(int amount, slice to, int mode) impure inline_ref {
+    cell msg = begin_cell()
+        .store_uint(0x18, 6)
+        .store_slice(to)
+        .store_coins(amount)
+        .store_uint(0, 107)
+    .end_cell();
+    send_raw_message(msg, mode);
+}
+
+() send_simple_message(int amount, slice to, cell body, int mode) impure inline_ref {
+    cell msg = begin_cell()
+        .store_uint(0x18, 6)
+        .store_slice(to)
+        .store_coins(amount)
+        .store_uint(1, 107)
+        .store_ref(body)
+    .end_cell();
+    send_raw_message(msg, mode);
+}
+
+() send_message_nobounce(int amount, slice to, cell body, int mode) impure inline_ref {
+    cell msg = begin_cell()
+        .store_uint(0x10, 6)
+        .store_slice(to)
+        .store_coins(amount)
+        .store_uint(1, 107)
+        .store_ref(body)
+    .end_cell();
+    send_raw_message(msg, mode);
+}
+
+() send_message_with_stateinit(int amount, slice to, cell state_init, cell body, int mode) impure inline_ref {
+    cell msg = begin_cell()
+        .store_uint(0x18, 6)
+        .store_slice(to)
+        .store_coins(amount)
+        .store_uint(7, 108)
+        .store_ref(state_init)
+        .store_ref(body)
+    .end_cell();
+    send_raw_message(msg, mode);
+}
+
+
+;; common utils
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+const FWD_GAS = 35000000; ;; 0.04 TON
+
+() send_payload(slice caller, cell payload) impure inline_ref {
+  cell msg = begin_cell()
+    .store_uint(0x18, 6)
+    .store_slice(caller) 
+    .store_coins(0) 
+    .store_uint(1, 1 + 4 + 4 + 64 + 32 + 1 + 1)
+    .store_ref(payload)
+  .end_cell();
+  send_raw_message(msg, 128); ;; CARRY_ALL_BALANCE
+}
+
+(int) get_workchain(slice address) inline {
+  (int wc, _) = parse_std_addr(address);
+  return wc;
+}
+
+() force_chain(int workchain, slice address, int error_code) impure inline {
+  (int wc) = get_workchain(address);
+  throw_unless(error_code, wc == workchain);
+}
+
+
+
+;;;
+;;;
+;;;
+;;;
+;;;
+;;;
+;;;
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; | POOL DEPENDENT FUNCTIONS
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; op.func 
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+const transfer = 0xf8a7ea5;
+const transfer_notification = 0x7362d09c;
+const internal_transfer = 0x178d4519;
+const excesses = 0xd53276db;
+const burn = 0x595f07bc;
+const burn_notification = 0x7bdd97de;
+
+const provide_wallet_address = 0x2c76b973;
+const take_wallet_address = 0xd1735400;
+
+
+const swap = "swap"c;
+const provide_lp = "provide_lp"c;
+const pay_to = "pay_to"c;
+
+;; swap callbacks opcodes
+const swap_refund_no_liq = "swap_refund_no_liq"c;
+const swap_refund_reserve_err = "swap_refund_reserve_err"c;
+
+const swap_ok_ref = "swap_ok_ref"c;
+const swap_ok = "swap_ok"c;
+const burn_ok = "burn_ok"c;
+const refund_ok = "refund_ok"c;
+
+const collect_fees = "collect_fees"c;
+const set_fees = "set_fees"c;
+const reset_gas = "reset_gas"c;
+const add_liquidity = "add_liquidity"c;
+const cb_add_liquidity = "cb_add_liquidity"c;
+const cb_refund_me = "cb_refund_me"c;
+
+;; async "get" calls
+const getter_pool_data = "getter_pool_data"c;
+const getter_expected_outputs = "getter_expected_outputs"c;
+const getter_lp_account_address = "getter_lp_account_address"c;
+const getter_expected_tokens = "getter_expected_tokens"c;
+const getter_expected_liquidity = "getter_expected_liquidity"c;
+
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; Params 
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; update pool params (set_fees, reset_gas, collect_fees)
+;;
+;; This section defines constants and helper functions used for updating pool
+;; parameters, such as fees and gas settings. These constants ensure that
+;; the pool operates within safe limits and according to the TON blockchain rules.
+;;
+;; Constants:
+;; - WORKCHAIN:
+;;     The designated workchain ID (0 is the main workchain used by this contract).
+;;
+;; - REQUIRED_TON_RESERVE:
+;;     The minimum required TON reserve (in nanotons) that must be retained to ensure
+;;     the pool's operational liquidity and prevent complete depletion.
+;;
+;; - REQUIRED_FEES_MINT:
+;;     The required amount of TON (in nanotons) needed for fee minting. This guarantees
+;;     that enough funds are available to cover gas fees or administrative costs.
+;;
+;; - REQUIRED_MIN_LIQUIDITY:
+;;     The minimum liquidity that must be provided to the pool. This prevents transactions
+;;     that would result in too low liquidity, ensuring pool viability.
+;;
+;; - REQUIRED_MIN_COLLECT_FEES:
+;;     The minimum amount of fees that must be collected before a fee collection operation
+;;     is allowed, preventing insignificant payouts.
+;;
+;; - MAX_COINS:
+;;     The upper limit for coins in a transaction (2^120 - 1). This follows the TON specifications,
+;;     ensuring that coin values remain within safe ranges.
+;;
+;; - PROVIDE_ADD_GAS_CONSUMPTION:
+;;     The fixed amount of gas consumed when adding liquidity to the pool. This helps in correctly
+;;     estimating the total gas fee required for liquidity operations.
+;;
+;; - FEE_DIVIDER:
+;;     A constant used for scaling fee percentages in calculations.
+;;
+;; - MIN_FEE and MAX_FEE:
+;;     The lower and upper bounds (0% and 1% respectively) that restrict fee settings, ensuring the fees
+;;     remain within a reasonable and safe range.
+;;
+;; - HOLE_ADDRESS:
+;;     A special "null" or burn address used as a placeholder when no valid address is provided.
+;;     This address typically locks tokens permanently.
+;;
+;; Functions:
+;; - addr_none:
+;;     An inline assembly function that returns an "empty" or "none" address slice.
+;;
+;; - URI_BASE and URI_END:
+;;     These string constants are used to build URIs that point to metadata JSON files related
+;;     to liquidity pool tokens. The base and suffix are concatenated with dynamic parts to form the full URL.
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+const WORKCHAIN = 0;
+
+const REQUIRED_TON_RESERVE = 10000000;       ;; Minimum TON reserve required (in nanotons) for safe pool operation
+const REQUIRED_FEES_MINT = 30000000;         ;; Required TON amount (in nanotons) for fee minting, ensuring sufficient funds for gas fees
+const REQUIRED_MIN_LIQUIDITY = 1000;         ;; Minimum liquidity required to ensure the pool is viable and operational
+const REQUIRED_MIN_COLLECT_FEES = 1000000;     ;; Minimum fee amount required before initiating fee collection
+
+;; according to https://ton.org/docs/#/smart-contracts/tvm-instructions/instructions, 
+;; coins are in the range 0...2^120 - 1
+const MAX_COINS = 1329227995784915872903807060280344575; ;; Maximum allowed coins (2^120 - 1)
+
+const PROVIDE_ADD_GAS_CONSUMPTION = 10000000; ;; Fixed amount of gas consumed when adding liquidity
+
+const FEE_DIVIDER = 10000; ;; Divider for fee percentage calculations for proper scaling
+const MIN_FEE = 0;         ;; Minimum allowed fee percentage (0%)
+const MAX_FEE = 200;       ;; Maximum allowed fee percentage (2%, represented as 100/10000)
+
+const HOLE_ADDRESS = "EQAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAM9c"a; ;; Special null/burn address used as a placeholder
+
+slice addr_none() asm "<b b{00} s, b> <s PUSHSLICE"; ;; Inline assembly function returning an 'empty' or none address slice
+
+const URI_BASE = "https://lp.ston.fi/0:"; ;; Base URL for liquidity pool token metadata
+const URI_END = ".json";                ;; Suffix for liquidity pool token metadata URI
+
+
+
+const NO_LIQUIDITY = 80;
+const ZERO_OUTPUT = 81;
+const INVALID_CALLER = 82;
+const INSUFFICIENT_GAS = 83;
+const FEE_OUT_RANGE = 85;
+const INVALID_TOKEN = 86;
+const LOW_AMOUNT = 87;
+const LOW_LIQUIDITY = 88;
+const WRONG_K = 89;
+const MATH_ERROR = 90;
+const INVALID_RECIPIENT = 91;
+
+const WRONG_OP = 0xffff;
+
+
+
+int sqrt(int x) inline {
+  if (x == 0) { return x; }
+
+  int r = 181;
+  int xx = x;
+  if (xx >= 0x100000000000000000000000000000000) {
+    xx >>= 128;
+    r <<= 64;
+  }
+  if (xx >= 0x10000000000000000) {
+    xx >>= 64;
+    r <<= 32;
+  }
+  if (xx >= 0x100000000) {
+    xx >>= 32;
+    r <<= 16;
+  }
+  if (xx >= 0x10000) {
+    xx >>= 16;
+    r <<= 8;
+  }
+
+  r = (r * (xx + 65536)) >> 18;
+
+  repeat(7) {
+    r = (r + x / r) >> 1;
+  }
+
+  int r1 = x / r;
+
+  return (r < r1 ? r : r1);
+}
+
+() call_pay_to(int amount, int mode, int query_id, slice to_address, int exit_code, int amount0_out, int amount1_out) impure inline_ref {
+  var body = begin_cell()
+    .store_uint(pay_to, 32)
+    .store_uint(query_id, 64)
+    .store_slice(to_address)
+    .store_uint(exit_code, 32)
+    .store_uint(1, 1)
+    .store_ref(begin_cell()
+      .store_coins(amount0_out) 
+      .store_slice(storage::token0_address)
+      .store_coins(amount1_out)
+      .store_slice(storage::token1_address)
+    .end_cell());
+  send_message_nobounce(amount, storage::router_address, body.end_cell(), mode);
+}
+
+int is_resolvable?(slice addr) inline {
+    (int wc, _) = parse_std_addr(addr);
+    return wc == WORKCHAIN;
+}
+
+slice address_to_hex_string(int value) inline {
+  if (value == 0) {
+    builder buffer = begin_cell();
+    int i = 0;
+    while (i < 64){
+      buffer = buffer.store_uint("0"u, 8);
+      i += 1;
+    }
+    return buffer.end_cell().begin_parse().preload_bits(i * 8);
+  } else {
+
+    int j = value;
+    int length = 0;
+    while (j != 0) {
+      length += 1;
+      j = j >> 4;
+    }
+    
+    int mask = 15;
+    builder buffer = begin_cell();
+
+    while (value != 0) {
+      int curr = (value & mask);
+      if(curr > 9){
+        buffer = buffer.store_uint(55 + curr, 8);
+      } else {
+        buffer = buffer.store_uint(48 + curr, 8);
+      }
+      value = value >> 4;
+    }
+
+    builder final_cell = begin_cell();
+
+    slice reversed_buffer = buffer.end_cell().begin_parse();
+    int i = 64;
+    while(i > 0){
+      i -= 1;
+      slice chr = reversed_buffer.preload_bits_offset(i * 8, 8);
+      final_cell = final_cell.store_slice(chr);
+    }
+    return final_cell.end_cell().begin_parse().preload_bits(512);
+  }
+}
+
+
+
+
+global slice storage::router_address;
+global int storage::lp_fee;
+global int storage::protocol_fee;
+global int storage::ref_fee;
+global slice storage::token0_address;
+global slice storage::token1_address;
+global int storage::total_supply_lp; 
+global int storage::collected_token0_protocol_fee;
+global int storage::collected_token1_protocol_fee; 
+global slice storage::protocol_fee_address;
+global int storage::reserve0;
+global int storage::reserve1; 
+global cell storage::jetton_lp_wallet_code;
+global cell storage::lp_account_code;
+
+// Add new global declarations for provider fees
+global int storage::collected_token0_provider_fee;
+global int storage::collected_token1_provider_fee;
+
+// Add new global for pool provider's fee address
+global slice storage::provider_fee_address;
+
+() load_storage() impure inline {
+    slice ds = get_data().begin_parse();
+    storage::router_address = ds~load_msg_addr();
+    storage::lp_fee = ds~load_uint(8);
+    storage::protocol_fee = ds~load_uint(8);
+    storage::ref_fee = ds~load_uint(8);
+    storage::token0_address = ds~load_msg_addr();
+    storage::token1_address = ds~load_msg_addr();
+    storage::total_supply_lp = ds~load_coins(); 
+
+    cell dc_0 = ds~load_ref(); 
+    slice ds_0 = dc_0.begin_parse();
+    storage::collected_token0_protocol_fee = ds_0~load_coins();
+    storage::collected_token1_protocol_fee = ds_0~load_coins(); 
+    storage::protocol_fee_address = ds_0~load_msg_addr();
+    // Load new provider fee address
+    storage::provider_fee_address = ds_0~load_msg_addr();
+    storage::reserve0 = ds_0~load_coins();
+    storage::reserve1 = ds_0~load_coins(); 
+    // Load new provider fee storage variables
+    storage::collected_token0_provider_fee = ds_0~load_coins();
+    storage::collected_token1_provider_fee = ds_0~load_coins();
+
+    storage::jetton_lp_wallet_code = ds~load_ref();
+    storage::lp_account_code = ds~load_ref();
+}
+
+() save_storage() impure inline {
+    set_data(begin_cell()
+        .store_slice(storage::router_address)
+        .store_uint(storage::lp_fee, 8) 
+        .store_uint(storage::protocol_fee, 8) 
+        .store_uint(storage::ref_fee, 8) 
+        .store_slice(storage::token0_address)
+        .store_slice(storage::token1_address) 
+        .store_coins(storage::total_supply_lp)
+        .store_ref(begin_cell()
+            .store_coins(storage::collected_token0_protocol_fee) 
+            .store_coins(storage::collected_token1_protocol_fee) 
+            .store_slice(storage::protocol_fee_address)
+            // Store new provider fee address
+            .store_slice(storage::provider_fee_address)
+            .store_coins(storage::reserve0) 
+            .store_coins(storage::reserve1)
+            // Store new provider fee storage variables
+            .store_coins(storage::collected_token0_provider_fee)
+            .store_coins(storage::collected_token1_provider_fee)
+        .end_cell())
+        .store_ref(storage::jetton_lp_wallet_code)
+        .store_ref(storage::lp_account_code)
+    .end_cell());
+}
+
+
+cell pack_jetton_lp_wallet_data(int balance, slice owner_address, slice jetton_master_address, cell jetton_wallet_code) inline {
+  return begin_cell()
+    .store_coins(balance)
+    .store_slice(owner_address)
+    .store_slice(jetton_master_address)
+    .store_ref(jetton_wallet_code)
+  .end_cell();
+}
+
+cell calculate_jetton_lp_wallet_state_init(slice owner_address, slice jetton_master_address, cell jetton_wallet_code) inline {
+  return begin_cell()
+    .store_uint(0, 2)
+    .store_dict(jetton_wallet_code)
+    .store_dict(pack_jetton_lp_wallet_data(0, owner_address, jetton_master_address, jetton_wallet_code))
+    .store_uint(0, 1)
+  .end_cell();
+}
+
+slice calculate_jetton_lp_wallet_address(cell state_init) inline {
+  return begin_cell().store_uint(4, 3)
+    .store_int(WORKCHAIN, 8)
+    .store_uint(cell_hash(state_init), 256)
+  .end_cell().begin_parse();
+}
+
+slice calculate_user_jetton_lp_wallet_address(slice owner_address, slice jetton_master_address, cell jetton_wallet_code) inline {
+  return calculate_jetton_lp_wallet_address(calculate_jetton_lp_wallet_state_init(owner_address, jetton_master_address, jetton_wallet_code));
+}
+
+cell pack_lp_account_data(slice user_address, slice pool_address, int amount0, int amount1) inline {
+  return begin_cell()
+    .store_slice(user_address)
+    .store_slice(pool_address)
+    .store_coins(amount0)
+    .store_coins(amount1)
+  .end_cell();
+}
+
+cell calculate_lp_account_state_init(slice user_address, slice pool_address, cell lp_account_code) inline {
+  return begin_cell()
+    .store_uint(0, 2)
+    .store_dict(lp_account_code)
+    .store_dict(pack_lp_account_data(user_address, pool_address, 0, 0))
+    .store_uint(0, 1)
+  .end_cell();
+}
+
+slice calculate_lp_account_address(cell state_init) inline {
+  return begin_cell().store_uint(4, 3)
+    .store_int(WORKCHAIN, 8)
+    .store_uint(cell_hash(state_init), 256)
+  .end_cell().begin_parse();
+}
+
+slice calculate_user_lp_account_address(slice user_address, slice pool_address, cell lp_account_code) inline {
+  return calculate_lp_account_address(calculate_lp_account_state_init(user_address, pool_address, lp_account_code));
+}
+
+(int, int, int, int) get_amount_out(int has_ref, int amount, int reserve_in, int reserve_out) inline {
+    // Compute base output using a standard constant product formula without fee adjustment on input
+    int base_out = (amount * reserve_out) / (reserve_in + amount);
+    // Fee amounts are computed as a fraction of the base output
+    int provider_fee_out = divc(base_out * storage::lp_fee, FEE_DIVIDER);
+    int protocol_fee_out = (storage::protocol_fee > 0) ? divc(base_out * storage::protocol_fee, FEE_DIVIDER) : 0;
+    int ref_fee_out = (has_ref & (storage::ref_fee > 0)) ? divc(base_out * storage::ref_fee, FEE_DIVIDER) : 0;
+    int final_out = base_out - provider_fee_out - protocol_fee_out - ref_fee_out;
+    return (final_out, protocol_fee_out, ref_fee_out, provider_fee_out);
+}
+
+
+() _mint_lp(int query_id, slice to, int amount) impure inline {
+  cell state_init = calculate_jetton_lp_wallet_state_init(to, my_address(), storage::jetton_lp_wallet_code);
+  slice to_wallet_address = calculate_jetton_lp_wallet_address(state_init);
+  var body = begin_cell()
+    .store_uint(internal_transfer, 32)
+    .store_uint(query_id, 64)
+    .store_coins(amount)
+    .store_slice(my_address())
+    .store_slice(to)
+    .store_coins(0) 
+    .store_uint(0, 1);
+  send_message_with_stateinit(0, to_wallet_address, state_init, body.end_cell(), CARRY_REMAINING_GAS);
+}
+
+;; get methods
+(int, int, slice, slice, int, int, int, slice, int, int) get_pool_data() method_id {
+    load_storage();
+    return (
+        storage::reserve0,
+        storage::reserve1,
+        storage::token0_address,
+        storage::token1_address,
+        storage::lp_fee,
+        storage::protocol_fee, 
+        storage::ref_fee,
+        storage::protocol_fee_address,
+        storage::collected_token0_protocol_fee, 
+        storage::collected_token1_protocol_fee
+    );
+}
+
+(int, int, int) get_expected_outputs(int amount, slice token_wallet) method_id {
+    load_storage();
+    throw_unless(NO_LIQUIDITY, storage::total_supply_lp > REQUIRED_MIN_LIQUIDITY);
+    int out = 0;
+    int protocol_fee_out = 0;
+    int ref_fee_out = 0;
+
+    if (equal_slices(token_wallet, storage::token0_address)) {
+            (out, protocol_fee_out, ref_fee_out) =  get_amount_out(
+            false, 
+            amount, 
+            storage::reserve0, 
+            storage::reserve1
+        );
+    }
+    if (equal_slices(token_wallet, storage::token1_address)) {
+            (out, protocol_fee_out, ref_fee_out) =  get_amount_out(
+            false, 
+            amount, 
+            storage::reserve1, 
+            storage::reserve0
+        );
+    }
+    return ((out < 0 ? 0 : out), protocol_fee_out, ref_fee_out);
+}
+
+;; estimate expected lp tokens minted when providing liquidity
+(int) get_expected_tokens(int amount0, int amount1) method_id {
+    load_storage();
+    return min(amount0 * storage::total_supply_lp / storage::reserve0, amount1 * storage::total_supply_lp / storage::reserve1);
+}
+
+(int, int) get_expected_liquidity(int jetton_amount) method_id {
+    load_storage();
+    throw_unless(ZERO_OUTPUT, jetton_amount > 0); 
+
+    int amount0_out = (jetton_amount * storage::reserve0) / storage::total_supply_lp; 
+    int amount1_out = (jetton_amount * storage::reserve1) / storage::total_supply_lp; 
+    
+    throw_unless(ZERO_OUTPUT, (amount0_out > 0) & (amount1_out > 0));
+
+    return (amount0_out, amount1_out);
+}
+
+slice get_lp_account_address(slice owner_address) method_id {
+    load_storage();
+    return calculate_user_lp_account_address(owner_address, my_address(), storage::lp_account_code); 
+}
+
+;; standard jetton 'get' methods 
+(int, int, slice, cell, cell) get_jetton_data() method_id {
+    load_storage();
+    (_, int hashpart) = parse_std_addr(my_address());
+
+    cell content_lp = begin_cell()
+        .store_uint(0x01, 8)
+        .store_slice(URI_BASE)
+        .store_slice(address_to_hex_string(hashpart))
+        .store_slice(URI_END)
+    .end_cell();
+
+    return (storage::total_supply_lp, -1, storage::router_address, content_lp, storage::jetton_lp_wallet_code);
+}
+
+slice get_wallet_address(slice owner_address) method_id {
+    load_storage();
+    return calculate_user_jetton_lp_wallet_address(owner_address, my_address(), storage::jetton_lp_wallet_code); 
+}
+
+
+
+
+() handle_router_messages(int op, int query_id, int my_balance, int msg_value, slice in_msg_body) impure inline {
+    if (op == swap) {
+        (slice from_user_address, slice token_wallet, int amount, int min_out, int has_ref) = (in_msg_body~load_msg_addr(), in_msg_body~load_msg_addr(), in_msg_body~load_coins(), in_msg_body~load_coins(), in_msg_body~load_uint(1));
+        cell ref_bodycell = in_msg_body~load_ref(); 
+        slice ref_body_slice = ref_bodycell.begin_parse();
+        slice from_real_user = ref_body_slice~load_msg_addr(); ;; parse who initialized the swap, always present
+
+        int out = 0;
+        int protocol_fee_out = 0;
+        int ref_fee_out = 0;
+        int provider_fee_out = 0;
+        int tmp_am_0 = 0;
+        int tmp_am_1 = 0;
+        slice ref_address = addr_none();
+
+        int mode = CARRY_REMAINING_GAS;
+        int gas = 0;
+    
+        if (has_ref) {
+            mode = NORMAL;
+            gas = (msg_value - get_gas_fee(25000, WORKCHAIN)) / 2;
+            ref_address = ref_body_slice~load_msg_addr();
+        }
+
+        if (equal_slices(token_wallet, storage::token0_address)) { 
+            (out, protocol_fee_out, ref_fee_out, provider_fee_out) = get_amount_out(has_ref, amount, storage::reserve0, storage::reserve1);
+            tmp_am_0 = amount;
+        } else {
+            (out, protocol_fee_out, ref_fee_out, provider_fee_out) = get_amount_out(has_ref, amount, storage::reserve1, storage::reserve0);
+            tmp_am_1 = amount;
+        }
+
+        ;; refund if not enough liquidity or not enough output or output less than min_out
+        if ((storage::total_supply_lp <= 0) | ((out <= 0) | (min_out >= out))) {
+            call_pay_to(0, CARRY_REMAINING_GAS, query_id, from_real_user, swap_refund_no_liq, tmp_am_0, tmp_am_1);
+            return ();
+        }
+
+        if (tmp_am_0) {
+            ;; swap token0 for token1
+            storage::reserve0 += amount;
+            storage::reserve1 -= (out + protocol_fee_out + ref_fee_out + provider_fee_out);
+            storage::collected_token1_protocol_fee += protocol_fee_out;
+            storage::collected_token1_provider_fee += provider_fee_out;
+
+            ;; refund if not enough balance or exceed max balance
+            if ((storage::reserve0 > MAX_COINS) | (storage::reserve1 <= 0)) {
+                call_pay_to(0, CARRY_REMAINING_GAS, query_id, from_real_user, swap_refund_reserve_err, tmp_am_0, tmp_am_1);
+                return ();
+            }
+
+            if (mode == NORMAL) { ;; 2 messages, pay referral
+                call_pay_to(gas, mode | IGNORE_ERRORS, query_id, ref_address, swap_ok_ref, 0, ref_fee_out); 
+            }
+            call_pay_to(gas, mode, query_id, from_user_address, swap_ok, 0, out); 
+        } else {    
+            ;; swap token1 for token0
+            storage::reserve0 -= (out + protocol_fee_out + ref_fee_out + provider_fee_out);
+            storage::reserve1 += amount;
+            storage::collected_token0_protocol_fee += protocol_fee_out;
+            storage::collected_token0_provider_fee += provider_fee_out;
+
+            ;; refund if not enough balance or exceed max balance
+            if ((storage::reserve1 > MAX_COINS) | (storage::reserve0 <= 0) ){
+                call_pay_to(0, CARRY_REMAINING_GAS, query_id, from_real_user, swap_refund_reserve_err, tmp_am_0, tmp_am_1);
+                return ();
+            }
+
+            if (mode == NORMAL) { ;; 2 messages, pay referral
+                call_pay_to(gas, mode | IGNORE_ERRORS, query_id, ref_address, swap_ok_ref, ref_fee_out, 0); 
+            }
+            call_pay_to(gas, mode, query_id, from_user_address, swap_ok, out, 0); 
+        }
+        save_storage();
+        return ();
+    }
+
+    if (op == provide_lp) { 
+        (slice owner_addr, int min_lp_out, int amount0, int amount1) = (in_msg_body~load_msg_addr(), in_msg_body~load_coins(), in_msg_body~load_coins(), in_msg_body~load_coins());
+
+        cell state_init = calculate_lp_account_state_init(owner_addr, my_address(), storage::lp_account_code); 
+        slice to_lp_account_address = calculate_lp_account_address(state_init);
+
+        ;; ruote to lp_account
+        var body = begin_cell()
+            .store_uint(add_liquidity, 32)
+            .store_uint(query_id, 64)
+            .store_coins(amount0)
+            .store_coins(amount1)
+            .store_coins(min_lp_out);
+        send_message_with_stateinit(0, to_lp_account_address, state_init, body.end_cell(), CARRY_REMAINING_GAS);
+        return ();
+    }
+
+
+    if (op == reset_gas) { 
+        send_empty_message(my_balance - REQUIRED_TON_RESERVE, storage::router_address, NORMAL);
+        return ();
+    }
+
+    if (op == collect_fees) {
+        throw_unless(NO_LIQUIDITY, (storage::collected_token0_protocol_fee > 0) & (storage::collected_token1_protocol_fee > 0));
+        throw_unless(INVALID_RECIPIENT, ~ equal_slices(storage::protocol_fee_address, HOLE_ADDRESS));
+        throw_unless(INVALID_RECIPIENT, ~ equal_slices(storage::provider_fee_address, HOLE_ADDRESS));
+        call_pay_to(0, CARRY_REMAINING_GAS, query_id, storage::protocol_fee_address, 0, storage::collected_token0_protocol_fee, storage::collected_token1_protocol_fee);
+        storage::collected_token0_protocol_fee = 0;
+        storage::collected_token1_protocol_fee = 0;
+        save_storage();
+        return ();
+    }
+
+  
+    if (op == set_fees) { 
+        (int new_lp_fee, int new_protocol_fee, int new_ref_fee, slice new_protocol_fee_address, slice new_provider_fee_address) = 
+             (in_msg_body~load_uint(8), in_msg_body~load_uint(8), in_msg_body~load_uint(8), in_msg_body~load_msg_addr(), in_msg_body~load_msg_addr());
+        throw_unless(FEE_OUT_RANGE, (MIN_FEE <= new_lp_fee) & (new_lp_fee <= MAX_FEE));
+        throw_unless(FEE_OUT_RANGE, (MIN_FEE <= new_protocol_fee) & (new_protocol_fee <= MAX_FEE));
+        throw_unless(FEE_OUT_RANGE, (MIN_FEE <= new_ref_fee) & (new_ref_fee <= MAX_FEE));
+        storage::lp_fee = new_lp_fee;
+        storage::protocol_fee = new_protocol_fee;
+        storage::ref_fee = new_ref_fee;
+        storage::protocol_fee_address = new_protocol_fee_address;
+        storage::provider_fee_address = new_provider_fee_address;
+        save_storage();
+        return ();
+    }
+
+    throw(WRONG_OP);
+}
+
+
+;; handle onchain 'get' calls
+
+(int) handle_getter_messages(int msg_value, int fwd_fee, int op, int query_id, slice sender_address, slice in_msg_body) impure inline {
+    raw_reserve(0, 4);
+
+    if (op == getter_pool_data) { 
+        var payload = begin_cell()
+            .store_uint(getter_pool_data, 32)
+            .store_uint(query_id, 64)
+            .store_coins(storage::reserve0)
+            .store_coins(storage::reserve1)
+            .store_slice(storage::token0_address)
+            .store_slice(storage::token1_address)
+            .store_ref(begin_cell()
+                .store_uint(storage::lp_fee, 8)
+                .store_uint(storage::protocol_fee, 8)
+                .store_uint(storage::ref_fee, 8)
+                .store_slice(storage::protocol_fee_address)
+                .store_coins(storage::collected_token0_protocol_fee)
+                .store_coins(storage::collected_token1_protocol_fee)
+            .end_cell());
+        send_payload(sender_address, payload.end_cell());
+        return (true);
+    }
+
+    if (op == getter_expected_outputs) { 
+        throw_unless(NO_LIQUIDITY, storage::total_supply_lp > REQUIRED_MIN_LIQUIDITY);
+        (int amount, slice token_wallet) = (in_msg_body~load_coins(), in_msg_body~load_msg_addr());
+
+        int out = 0;
+        int ok = false;
+        int protocol_fee_out = 0;
+        int ref_fee_out = 0;
+
+        if (equal_slices(token_wallet, storage::token0_address)) {
+            ok = true;
+            (out, protocol_fee_out, ref_fee_out) = get_amount_out(false, amount, storage::reserve0, storage::reserve1);
+        }
+        if (equal_slices(token_wallet, storage::token1_address)) {
+            ok = true;
+            (out, protocol_fee_out, ref_fee_out) = get_amount_out(false, amount, storage::reserve1, storage::reserve0);
+        }
+    
+        throw_unless(INVALID_TOKEN, ok);
+    
+        var payload = begin_cell()
+            .store_uint(getter_expected_outputs, 32)
+            .store_uint(query_id, 64)
+            .store_coins((out <= 0 ? 0 : out))
+            .store_coins(protocol_fee_out)
+            .store_coins(ref_fee_out);
+        send_payload(sender_address, payload.end_cell());
+        return (true);
+    }
+
+    if (op == getter_lp_account_address) { 
+        slice user_address = in_msg_body~load_msg_addr();
+    
+        var payload = begin_cell()
+            .store_uint(getter_expected_outputs, 32)
+            .store_uint(query_id, 64)
+            .store_slice(calculate_user_lp_account_address(user_address, my_address(), storage::lp_account_code));
+        send_payload(sender_address, payload.end_cell());
+        return (true);
+    }
+
+    if (op == getter_expected_tokens) { 
+        (slice user_address, int amount0, int amount1) = (in_msg_body~load_msg_addr(), in_msg_body~load_coins(), in_msg_body~load_coins());
+
+        int to_mint0 = (amount1 * storage::total_supply_lp) / storage::reserve0;
+        int to_mint1 = (amount0 * storage::total_supply_lp) / storage::reserve1;
+
+        int liquidity = min(to_mint0, to_mint1);
+    
+        var payload = begin_cell()
+            .store_uint(getter_expected_tokens, 32)
+            .store_uint(query_id, 64)
+            .store_coins(liquidity);
+        send_payload(sender_address, payload.end_cell());
+        return (true);
+    }
+
+    if (op == getter_expected_liquidity) { 
+        int jetton_amount = in_msg_body~load_coins();
+
+        throw_unless(ZERO_OUTPUT, jetton_amount > 0); 
+
+        int amount0_out = (jetton_amount * storage::reserve0) / storage::total_supply_lp; 
+        int amount1_out = (jetton_amount * storage::reserve1) / storage::total_supply_lp; 
+      
+        throw_unless(ZERO_OUTPUT, (amount0_out > 0) & (amount1_out > 0));
+
+        var payload = begin_cell()
+            .store_uint(getter_expected_liquidity, 32)
+            .store_uint(query_id, 64)
+            .store_coins(amount0_out)
+            .store_coins(amount1_out);
+        send_payload(sender_address, payload.end_cell());
+        return (true);
+    }
+
+    if (op == provide_wallet_address) {
+        ;; Reference implementation:
+        ;; https://github.com/ton-blockchain/token-contract/blob/920c5aa3a33ede6405b5653147895c9e27bfe535/ft/jetton-minter-discoverable.fc#L100
+        throw_unless(75, msg_value > fwd_fee + PROVIDE_ADD_GAS_CONSUMPTION);
+
+        (slice owner_address, int include_address?) = (in_msg_body~load_msg_addr(), in_msg_body~load_uint(1));
+
+        cell included_address = include_address? ? begin_cell().store_slice(owner_address).end_cell() : null();
+
+        var msg = begin_cell()
+            .store_uint(take_wallet_address, 32)
+            .store_uint(query_id, 64);
+
+        if (is_resolvable?(owner_address)) {
+            msg = msg.store_slice(calculate_user_jetton_lp_wallet_address(owner_address, my_address(), storage::jetton_lp_wallet_code));
+        } else {
+            msg = msg.store_uint(0, 2); ;; addr_none
+        }
+
+        send_payload(sender_address, msg.store_maybe_ref(included_address).end_cell());
+        return (true);
+    }
+    
+    return (false); ;; wrong op
+}
+
+
+
+
+
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+;; | MAIN POOL CONTRACT
+;; | Internal Message Handler: recv_internal
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+
+;; This function processes incoming internal messages that instruct the
+;; pool contract to perform operations such as burning LP jettons (liquidity tokens)
+;; to release liquidity, handling callbacks after liquidity addition, processing refunds,
+;; collecting protocol fees, and delegating swap or governance messages.
+;;
+;; PARAMETERS:
+;;   my_balance   - The current balance of the pool contract.
+;;   msg_value    - The amount of coins sent along with the message.
+;;   in_msg_full  - The complete incoming message (as a cell), including headers.
+;;   in_msg_body  - A slice of the incoming message body that contains operation details.
+;;
+;; OPERATION:
+;;   1. Exit early if no message body is provided.
+;;   2. Parse the full message header to extract message flags and the sender's address.
+;;   3. Abort processing if specific flags (such as bounce flags) are set.
+;;   4. Load the contract's storage so that the current state variables (e.g., reserves,
+;;      total LP supply, fee collection amounts) are available.
+;;   5. Extract the operation code and a query ID from the message body.
+;;   6. For various opcodes (such as burn_notification, cb_add_liquidity, cb_refund_me,
+;;      collect_fees), execute the necessary calculations and update the storage.
+;;   7. Delegate the message to the router or getter handlers if none of the opcodes match.
+;;
+;; ERROR HANDLING:
+;;   Many steps use `throw_unless` to ensure that necessary conditions (such as sufficient gas,
+;;   proper caller verification, and non-zero transaction amounts) are met. If validations fail,
+;;   the function throws an appropriate error code.
+;;
+;; SIDE EFFECTS:
+;;   The function updates storage variables (reserves, total_supply_lp, etc.), issues outgoing
+;;   messages using call_pay_to, send_message_with_stateinit or send_message_nobounce, and performs
+;;   state persistence using save_storage.
+;;
+() recv_internal(int my_balance, int msg_value, cell in_msg_full, slice in_msg_body) impure {
+  
+  ;; If the incoming message body is empty, there's nothing to do.
+  if (in_msg_body.slice_empty?()) {
+    return ();
+  }
+  
+  ;; Begin parsing the complete incoming message to extract header information.
+  slice cs = in_msg_full.begin_parse();
+  
+  ;; Read 4 bits from the header representing various flags.
+  int flags = cs~load_uint(4);
+  
+  ;; If the lowest-level flag is set (for example, a bounce flag), abort processing.
+  if (flags & 1) {
+    return ();
+  }
+
+  ;; Load the storage to access and update the pool's state (reserves, fees, etc.).
+  load_storage();
+
+  ;; Extract the sender's address from the message header.
+  slice sender_address = cs~load_msg_addr();
+
+  ;; From the message body, read 32 bits for the operation code (op) and 64 bits for the query_id.
+  (int op, int query_id) = (in_msg_body~load_uint(32), in_msg_body~load_uint(64));
+
+  ;; -----------------------------------------------------------------------
+  ;; Operation: burn_notification
+  ;;
+  ;; This block handles notifications sent by the LP wallet when LP jettons are
+  ;; burned (i.e., when liquidity is being released).
+  ;; -----------------------------------------------------------------------
+  if (op == burn_notification) { 
+    ;; Extract the amount of jettons burned, the address initiating the burn,
+    ;; and an optional response address.
+    (int jetton_amount, slice from_address, slice response_address) = 
+         (in_msg_body~load_coins(), 
+          in_msg_body~load_msg_addr(), 
+          in_msg_body~load_msg_addr());
+    
+    ;; Determine the required gas for processing this burn event.
+    int gas_required = get_gas_fee(25000, WORKCHAIN);
+    
+    ;; Continue parsing additional message header fields needed for gas fee estimation.
+    cs~load_msg_addr();
+    cs~load_coins();
+    cs~skip_bits(1);
+    cs~load_coins();
+    
+    ;; Ensure that the amount of coins sent with this message covers the estimated gas cost.
+    throw_unless(INSUFFICIENT_GAS, (msg_value > gas_required) & (msg_value > cs~load_coins() * 6));
+    
+    ;; Verify that the LP wallet sending this burn notification is the correct one.
+    throw_unless(INVALID_CALLER, equal_slices(
+            calculate_user_jetton_lp_wallet_address(from_address, my_address(), storage::jetton_lp_wallet_code),
+            sender_address));
+    
+    ;; The burnt jetton amount must be greater than zero.
+    throw_unless(ZERO_OUTPUT, jetton_amount > 0);
+
+    ;; Calculate the amounts of token0 and token1 to return to the user,
+    ;; proportional to the pool's reserves and the total LP token supply.
+    int amount0_out = (jetton_amount * storage::reserve0) / storage::total_supply_lp;
+    int amount1_out = (jetton_amount * storage::reserve1) / storage::total_supply_lp;
+    
+    ;; Ensure that both token amounts to be released are positive.
+    throw_unless(ZERO_OUTPUT, (amount0_out > 0) & (amount1_out > 0));
+
+    ;; Update the pool's state by reducing the reserves and the total supply of LP tokens.
+    storage::reserve0 -= amount0_out;
+    storage::reserve1 -= amount1_out;
+    storage::total_supply_lp -= jetton_amount;
+
+    ;; Prepare variables for sending a response.
+    int gas = 0;
+    int mode = CARRY_REMAINING_GAS;
+    
+    ;; If the response_address is non-zero, calculate a gas portion for further messages and
+    ;; change the sending mode to NORMAL.
+    if (response_address.preload_uint(2) != 0) {
+      gas = (msg_value - gas_required) / 2;
+      mode = NORMAL;
+      var body = begin_cell()
+        .store_uint(excesses, 32)
+        .store_uint(query_id, 64);
+      send_message_nobounce(gas, response_address, body.end_cell(), IGNORE_ERRORS);
+    }
+    
+    ;; Notify the original sender of the liquidity release by sending a message with the
+    ;; calculated token amounts.
+    call_pay_to(gas, mode, query_id, from_address, burn_ok, amount0_out, amount1_out);
+    
+    ;; Persist the updated state to storage.
+    save_storage();
+    return ();
+  }
+  
+  ;; -----------------------------------------------------------------------
+  ;; Operation: cb_add_liquidity
+  ;;
+  ;; This section handles callbacks that occur after a user's LP account has
+  ;; successfully added liquidity to the pool.
+  ;; -----------------------------------------------------------------------
+  if (op == cb_add_liquidity) {
+    ;; Read the added token amounts (for token0 and token1), the user's address, and
+    ;; the minimum LP tokens expected as a return.
+    (int tot_am0, int tot_am1, slice user_address, int min_lp_out) =
+         (in_msg_body~load_coins(),
+          in_msg_body~load_coins(),
+          in_msg_body~load_msg_addr(),
+          in_msg_body~load_coins());
+    
+    ;; Compute the state initialization cell for the user's LP account.
+    cell acc_state_init = calculate_lp_account_state_init(user_address, my_address(), storage::lp_account_code);
+    
+    ;; Verify that the message sender is indeed the correct LP account by comparing addresses.
+    throw_unless(INVALID_CALLER, equal_slices(
+         calculate_lp_account_address(acc_state_init),
+         sender_address
+    ));
+
+    int liquidity = 0;
+    slice to = "";
+
+    ;; If the pool is initializing (i.e. no existing liquidity), handle the special case:
+    if (storage::total_supply_lp == 0) {
+      ;; Compute initial liquidity as the square root of the product of the token amounts,
+      ;; scaled down by the required minimum liquidity. The resulting LP tokens are locked
+      ;; (assigned to a null address) to prevent the pool from being fully drained.
+      liquidity = sqrt(tot_am0 * tot_am1) / REQUIRED_MIN_LIQUIDITY;
+      to = addr_none();
+    } else {
+      ;; For subsequent liquidity additions, calculate the LP tokens to mint based on
+      ;; the pool's current ratios. Mint the minimum of the two proportional amounts.
+      int to_mint0 = (tot_am0 * storage::total_supply_lp) / storage::reserve0;
+      int to_mint1 = (tot_am1 * storage::total_supply_lp) / storage::reserve1;
+      liquidity = min(to_mint0, to_mint1);
+      to = user_address;
+    }
+
+    ;; Update the pool's reserves and the total LP token supply to include the newly added amounts.
+    storage::reserve0 += tot_am0;
+    storage::reserve1 += tot_am1;
+    storage::total_supply_lp += liquidity;
+
+    ;; Check if the minted LP tokens are below the user's minimum expectation or if the new
+    ;; reserves exceed the defined maximum number of coins.
+    if ((liquidity < min_lp_out) | ((storage::reserve0 > MAX_COINS) | (storage::reserve1 > MAX_COINS))) {
+      var body = begin_cell()
+        .store_uint(add_liquidity, 32)
+        .store_uint(query_id, 64)
+        .store_coins(tot_am0)
+        .store_coins(tot_am1)
+        .store_coins(0); ;; Hardcode zero to avoid minting loops between pool and LP account.
+      ;; Resend the liquidity addition message with the state initialization because the LP
+      ;; account might already be destroyed.
+      send_message_with_stateinit(0, sender_address, acc_state_init, body.end_cell(), CARRY_REMAINING_GAS + IGNORE_ERRORS);
+    } else {
+      ;; Mint the calculated LP tokens for the user and update storage.
+      _mint_lp(query_id, to, liquidity);
+      save_storage();
+    }
+    return ();
+  }
+
+  ;; -----------------------------------------------------------------------
+  ;; Operation: cb_refund_me
+  ;;
+  ;; When the user's LP account needs to refund coins after a liquidity addition,
+  ;; this block handles the refund procedure.
+  ;; -----------------------------------------------------------------------
+  if (op == cb_refund_me) {
+    ;; Extract token amounts related to the refund and the user's address.
+    (int tot_am0, int tot_am1, slice user_address) =
+         (in_msg_body~load_coins(),
+          in_msg_body~load_coins(),
+          in_msg_body~load_msg_addr());
+    
+    ;; Ensure the refund message is coming from the correct LP account associated with the user.
+    throw_unless(INVALID_CALLER, equal_slices(
+         calculate_user_lp_account_address(user_address, my_address(), storage::lp_account_code),
+         sender_address
+    ));
+    
+    ;; Send the refund message with the required amounts.
+    call_pay_to(0, CARRY_REMAINING_GAS, query_id, user_address, refund_ok, tot_am0, tot_am1);
+    return ();
+  }
+
+  ;; -----------------------------------------------------------------------
+  ;; Routing: Swap, Provide_LP, and Governance Messages
+  ;;
+  ;; If the sender is the authorized router address, pass the message to the
+  ;; router message handler which will process swaps, liquidity provision requests,
+  ;; and governance operations.
+  ;; -----------------------------------------------------------------------
+  if (equal_slices(sender_address, storage::router_address)) {
+    handle_router_messages(op, query_id, my_balance, msg_value, in_msg_body);
+    return ();
+  }
+
+  ;; -----------------------------------------------------------------------
+  ;; Operation: collect_fees
+  ;;
+  ;; This operation allows any caller to trigger fee collection, provided that:
+  ;;   - The pool has sufficient liquidity.
+  ;;   - The collected fees are above their minimum thresholds.
+  ;;   - The protocol fee recipient is set (not equal to the null/burn address).
+  ;; It distributes the fees to the protocol fee address and a small reward to the caller.
+  ;; -----------------------------------------------------------------------
+  if (op == collect_fees) { ;; This operation can throw if conditions are not met.
+    throw_unless(NO_LIQUIDITY, storage::total_supply_lp > REQUIRED_MIN_LIQUIDITY);
+    throw_unless(LOW_LIQUIDITY, (storage::collected_token0_protocol_fee > REQUIRED_MIN_COLLECT_FEES) & 
+                                 (storage::collected_token1_protocol_fee > REQUIRED_MIN_COLLECT_FEES));
+    throw_unless(INVALID_RECIPIENT, ~ equal_slices(storage::protocol_fee_address, HOLE_ADDRESS));
+    throw_unless(INVALID_RECIPIENT, ~ equal_slices(storage::provider_fee_address, HOLE_ADDRESS));
+    
+    ;; Calculate the required gas for fee collection.
+    int gas_required = get_gas_fee(40000, WORKCHAIN);
+    
+    ;; Ensure that sufficient gas remains after removal of the fee collection gas.
+    throw_unless(INSUFFICIENT_GAS, (msg_value - gas_required) > 1000000000); ;; Ensures at least 1 ton is remaining
+    
+    ;; Allocate one-fourth of the remaining gas for distributing fee rewards.
+    int gas = (msg_value - gas_required) / 4;
+    
+    ;; Compute a small reward for the caller as 1/1000th of each collected protocol fee.
+    int reward0 = storage::collected_token0_protocol_fee / 1000;
+    int reward1 = storage::collected_token1_protocol_fee / 1000;
+    
+    ;; Deduct the calculated rewards from the total protocol fees.
+    storage::collected_token0_protocol_fee -= reward0;
+    storage::collected_token1_protocol_fee -= reward1;
+
+    ;; Ensure that the rewards and the remaining protocol fees are positive.
+    throw_unless(ZERO_OUTPUT, (reward0 > 0) & (reward1 > 0));
+    throw_unless(ZERO_OUTPUT, (storage::collected_token0_protocol_fee > 0) & 
+                                 (storage::collected_token1_protocol_fee > 0));
+
+    ;; Send the remaining protocol fees to the protocol fee address.
+    call_pay_to(gas * 3, NORMAL, query_id, storage::protocol_fee_address, 0,
+                storage::collected_token0_protocol_fee, storage::collected_token1_protocol_fee);
+
+    ;; Send the provider fees to the pool provider's address.
+    call_pay_to(gas, NORMAL, query_id, storage::provider_fee_address, 0,
+                storage::collected_token0_provider_fee, storage::collected_token1_provider_fee);
+
+    ;; Send the fee reward to the caller.
+    call_pay_to(gas, IGNORE_ERRORS, query_id, sender_address, 0, reward0, reward1);
+
+    ;; Reset the fee accumulator storage for both protocol and provider fees.
+    storage::collected_token0_protocol_fee = 0;
+    storage::collected_token1_protocol_fee = 0;
+    storage::collected_token0_provider_fee = 0;
+    storage::collected_token1_provider_fee = 0;
+    save_storage();
+    return ();
+  }
+
+  ;; -----------------------------------------------------------------------
+  ;; Fallback: Getter Message Handler
+  ;;
+  ;; If none of the known operation codes match, attempt to handle the message as
+  ;; a getter request, which is used for reading state from the contract.
+  ;; -----------------------------------------------------------------------
+  cs~load_msg_addr();
+  cs~load_coins();
+  cs~skip_bits(1);
+  cs~load_coins();
+  if (handle_getter_messages(msg_value, cs~load_coins(), op, query_id, sender_address, in_msg_body)) {
+    return ();
+  }
+
+  ;; If the opcode does not match any valid handler, throw an error indicating a wrong operation.
+  throw(WRONG_OP);
+}
